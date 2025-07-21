@@ -114,6 +114,9 @@ static char *meterbridge_reference="0";
 #define vu_len 65
 static int vu_dB=true;
 static float vu_bias=1.0f;
+static float vu_total=0.0f;
+static float vu_threshold_start=0.1f;
+static float vu_threshold_stop=0.001f;
 static int leading_zeros=1;
 static char *filename_prefix="jack_capture_";
 static DEFINE_ATOMIC(int64_t, num_frames_recorded)=0;
@@ -139,9 +142,13 @@ static int das_lame_quality = 2; // 0 best, 9 worst.
 static int das_lame_bitrate = -1;
 static int das_lame_samplerate = 0;
 static float ogg_vbr_quality = -1.0;
+static bool multi_record = false;
+static bool filename_ts = false;
 static bool use_jack_transport = false;
 static bool use_jack_freewheel = false;
 static bool use_manual_connections = false;
+static bool use_threshold_recording=false;
+static bool threshold_recording=false;
 #if HAVE_LIBLO
 static int osc_port = -1;
 #endif
@@ -186,6 +193,7 @@ static float *vu_vals=NULL;
 static int   *vu_times=NULL;
 static int *vu_peaks=NULL;
 static float *vu_peakvals=NULL;
+
 
 /* Synchronization between jack process thread and disk thread. */
 static DEFINE_ATOMIC(bool, is_initialized) = false; // This $@#$@#$ variable is needed because jack ports must be initialized _after_ (???) the client is activated. (stupid jack)
@@ -352,7 +360,8 @@ static int autoincrease_callback(vringbuffer_t *vrb, bool first_call, int readin
     set_high_priority();
     return 0; }
 
-  if(timemachine_mode==true && timemachine_recording==false)
+  if ((timemachine_mode==true && timemachine_recording==false) ||
+      (use_threshold_recording==true && threshold_recording==false))
     return 0;
 
 #if 0
@@ -663,7 +672,8 @@ static void print_console(bool move_cursor_to_top_doit,bool force_update){
         vol[1] = '0'+ch;
       }
 
-      if (timemachine_mode==true && timemachine_recording==false) {
+      if (timemachine_mode==true && timemachine_recording==false)
+       {
 
         for(i=0;i<pos && val>0.0f;i++)
           vol[4+i] = vu_not_recording[i];
@@ -1297,6 +1307,70 @@ static int rotate_file(size_t frames, int reset_totals){
   return 1;
 }
 
+void find_filename() {
+  if (filename_ts) {
+    time_t timer;
+    char buffer[26];
+    struct tm* tm_info;
+    timer = time(NULL);
+    tm_info = localtime(&timer);
+    strftime(buffer, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+    sprintf(base_filename,"%s%s.%s",filename_prefix,buffer,soundfile_format);
+  }
+  else {
+    for(int i=1;i<100000;i++){
+      sprintf(base_filename,"%s%0*d.%s",filename_prefix,leading_zeros+1,i,soundfile_format);
+      if (access(base_filename,F_OK)) break;
+    }
+  }
+}
+
+static int new_file(int reset_totals){
+  ATOMIC_SET(g_store_sync, 0);
+  ssync_offset = 0;
+
+  if(write_to_stdout==false){
+    if(soundfile!=NULL)
+      sf_close (soundfile);
+#if HAVE_LAME
+    if(mp3file!=NULL){
+      mp3_write(NULL,0,true); // flush
+      lame_close(lame);
+      fclose(mp3file);
+    }
+#endif
+  }
+
+  print_message("Closing %s.\n", filename);
+  hook_file_closed(filename, total_overruns + total_xruns, disk_errors);
+
+  num_files=1;
+  free(filename);
+  filename = NULL;
+  find_filename();
+  disksize=0;
+
+  if (reset_totals) {
+    if (overruns > 0) {
+      print_message("jack_capture failed with a total of %d overruns.\n", total_overruns);
+      print_message("   try a bigger buffer than -B %f\n",min_buffer_time);
+    }
+    if (disk_errors > 0)
+      print_message("jack_capture failed with a total of %d disk errors.\n",disk_errors);
+    if (total_xruns > 0)
+      print_message("jack_capture encountered %d jack x-runs.\n", total_xruns);
+
+    /* reset totals on file-rotate */
+    disk_errors = 0;
+    total_overruns = 0;
+    total_xruns = 0;
+  }
+
+  if(!open_soundfile()) return 0;
+
+  return 1;
+}
+
 // To test filelimit handler, uncomment two next lines.
 //#undef UINT32_MAX
 //#define UINT32_MAX 100000+(1024*1024)
@@ -1457,7 +1531,9 @@ static enum vringbuffer_receiver_callback_return_t disk_callback(vringbuffer_t *
     return true;
   }
 
-  if (timemachine_mode==true && timemachine_recording==false) {
+  if ((timemachine_mode==true && timemachine_recording==false) ||
+     (use_threshold_recording==true && threshold_recording==false))
+  {
     int num_buffers = vringbuffer_reading_size(vrb);
     if (buffers_to_seconds(num_buffers) > timemachine_prebuffer)
       return VRB_CALLBACK_USED_BUFFER; // i.e throw away the buffer.
@@ -1467,6 +1543,10 @@ static enum vringbuffer_receiver_callback_return_t disk_callback(vringbuffer_t *
 
   if (timemachine_mode==true && printed_receive_message==false){
     print_message("Recording. Press <Return> to stop.\n");
+    printed_receive_message=true; }
+
+  if (use_threshold_recording==true && printed_receive_message==false){
+    print_message("Start threshold recording. Waiting for threshold stop level.\n");
     printed_receive_message=true; }
 
   if(use_jack_transport==true && printed_receive_message==false){
@@ -1584,6 +1664,15 @@ static void process_fill_buffer(sample_t *in[],buffer_t *buffer,int i,int end){
       safe_float_write(&vu_vals[ch], max_vu);
     }
   }
+
+  // Total VU
+  vu_total = 0.0;
+  for(ch=0;ch<num_channels;ch++) {
+    vu_total += safe_float_read(&vu_vals[ch]);
+  }
+  vu_total /= num_channels;
+  //printf("VU TOTAL=%f\r", vu_total);
+
   //fprintf(stderr,"pos: %d %d\n",pos,num_channels);
   buffer->pos=pos/num_channels;
 }
@@ -1654,6 +1743,12 @@ static int process(jack_nframes_t nframes, void *arg){
 
   jack_transport_state_t jack_transport_state=JackTransportStopped;
 
+  // Threshold recording
+  if (use_threshold_recording==true) {
+    if (vu_total>vu_threshold_start)
+      threshold_recording=true;
+  }
+
   // jack_transport
   if(use_jack_transport==true){
     jack_transport_state=jack_transport_query(client,NULL);
@@ -1720,11 +1815,25 @@ static int process(jack_nframes_t nframes, void *arg){
 
     ATOMIC_ADD(num_frames_recorded, nframes);
 
-    if((   use_jack_transport==true && jack_transport_state==JackTransportStopped)
-       || (use_jack_freewheel==true && freewheel_mode==0)
-       )
-      {
+    if (
+        (use_jack_transport==true && jack_transport_state==JackTransportStopped) ||
+        (use_jack_freewheel==true && freewheel_mode==0) ||
+        (threshold_recording==true && vu_total<vu_threshold_stop)
+       ) {
         send_buffer_to_disk_thread(current_buffer);
+        /*
+        if (multi_record==true) {
+          jack_transport_started = false;
+          jack_freewheel_started = false;
+          threshold_recording = false;
+          new_file(false);
+        }
+
+        else {
+          SEM_SIGNAL(stop_sem);
+          process_state=RECORDING_FINISHED;
+        }
+        */
         SEM_SIGNAL(stop_sem);
         process_state=RECORDING_FINISHED;
       }
@@ -2088,6 +2197,7 @@ static void create_ports(void){
 static void finish(int sig){
   (void)sig;
   //turn_on_echo(); //Don't think we can do this from a signal handler...
+  multi_record=false;
   SEM_SIGNAL(stop_sem);
 }
 
@@ -2221,9 +2331,14 @@ static const char *advanced_help =
   "                                     When jack transport stops, the recording is also stopped, and the program ends.\n"
   "[--jack-transport-multi]/[-jtm]   -> Similar to --jack-transport, but do not end program when jack transport stops.\n"
   "                                     Instead, record to a new file when jack_transport starts rolling again.\n"
-  "                                     (not implemented yet)\n"
-  "[--jack-freewheeling]/[-jf]       -> Start program, but do not start recording until jack enters freewheeling mode\n"
+  "[--jack-freewheel]/[-jf]          -> Start program, but do not start recording until jack enters freewheeling mode\n"
   "                                     When jack leaves freewheeling, the recording is also stopped, and the program ends.\n"
+  "[--jack-freewheel-multi]/[-jfm]   -> Similar to --jack-freewheel, but do not end program when jack leaves freewheeling.\n"
+  "                                     Instead, record to a new file when jack enters freewheeling mode again.\n"
+  "[--th-recording]/[-thr]           -> Start program, but do not start recording until VU level is over start_threshold.\n"
+  "                                     When VU level is under stop_threshold, the recording is stopped, and the program ends.\n"
+  "[--th-recording-multi]/[-thrm]    -> Similar to --th-recording, but do not end program when recording stops.\n"
+  "                                     Instead, record to a new file when VU level goes over start_threshold again.\n"
   "[--jack-name]/[-jn]               -> Set name of this jack_capture instance in the jack patchbay.\n"
   "[--manual-connections]/[-mc]      -> jack_capture will not connect any ports for you. \n"
   "[--bufsize s] or [-B s]           -> Initial/minimum buffer size in seconds. Default is 8 seconds\n"
@@ -2235,6 +2350,7 @@ static const char *advanced_help =
   "                                     Beware that you might risk overwriting an old file by using this option.\n"
   "                                     To only set prefix, use --filename-prefix / -fp instead.\n"
   "                                     (It's usually easier to set last argument instead of using this option)\n"
+  "[--filename-ts or [-fnts]         -> Add timestamp to filenames instead of generating indexes.\n"
   "[--osc] or [-O]                   -> Specify OSC port number to listen on. see --help-osc\n"
   "[--timestamp] or [-S]             -> create a FILENAME.tme file for each recording, storing\n"
   "                                     the system-time corresponding to the first audio sample.\n"
@@ -2376,9 +2492,14 @@ void init_arguments(int argc, char *argv[]){
       OPTARG("--meterbridge-type","-mt") use_meterbridge=true;meterbridge_type=OPTARG_GETSTRING();
       OPTARG("--meterbridge-reference","-mr") use_meterbridge=true;meterbridge_reference=OPTARG_GETSTRING();
       OPTARG("--jack-transport","-jt") use_jack_transport=true;
+      OPTARG("--jack-transport-multi","-jtm") use_jack_transport=true; multi_record=true;
       OPTARG("--jack-freewheel","-jf") use_jack_freewheel=true;
+      OPTARG("--jack-freewheel-multi","-jfm") use_jack_freewheel=true; multi_record=true;
+      OPTARG("--th-recording","-thr") use_threshold_recording=true; timemachine_prebuffer=0.1;
+      OPTARG("--th-recording-multi","-thrm") use_threshold_recording=true;  multi_record=true; timemachine_prebuffer=0.1;
       OPTARG("--manual-connections","-mc") use_manual_connections=true;
       OPTARG("--filename","-fn") base_filename=OPTARG_GETSTRING();
+      OPTARG("--filename-ts","-fnts") filename_ts=true;
       OPTARG("--osc","-O") {
 #if HAVE_LIBLO
         osc_port=atoi(OPTARG_GETSTRING());
@@ -2443,7 +2564,7 @@ void init_arguments(int argc, char *argv[]){
     }
   }
 
-  if(timemachine_mode==true) {
+  if(timemachine_mode==true || use_threshold_recording==true) {
     min_buffer_time += timemachine_prebuffer;
     max_buffer_time += timemachine_prebuffer;
   }
@@ -2456,17 +2577,11 @@ void init_arguments(int argc, char *argv[]){
       soundfile_format=soundfile_format_one_or_two;
   }
 
-
-  verbose_print("main() find filename\n");
   // Find filename
-  {
-    if(base_filename==NULL){
-      base_filename=my_calloc(1,5000);
-      for(int try=1;try<100000;try++){
-	sprintf(base_filename,"%s%0*d.%s",filename_prefix,leading_zeros+1,try,soundfile_format);
-	if(access(base_filename,F_OK)) break;
-      }
-    }
+  verbose_print("main() find filename\n");
+  if(base_filename==NULL){
+    base_filename=my_calloc(1,5000);
+  	find_filename();
   }
 
 }
@@ -2669,7 +2784,10 @@ void init_various(void){
         if (timemachine_mode==true) {
           print_message("Waiting to start recording of \"%s\"\n",base_filename);
           print_message("Press <Ctrl-C> to stop recording and quit.\n");
-        }else
+        } else if (use_threshold_recording==true) {
+          print_message("Waiting threshold level to start recording of \"%s\"\n",filename);
+          print_message("Press <Ctrl-C> to stop recording and quit.\n");
+        } else
           print_message("Recording to \"%s\". Press <Return> or <Ctrl-C> to stop.\n",base_filename);
         //fprintf(stderr,"Recording to \"%s\". Press <Return> or <Ctrl-C> to stop.\n",base_filename);
       }
@@ -2804,7 +2922,7 @@ int main (int argc, char *argv[]){
 
   stop_recording_and_cleanup();
 
-  if (timemachine_mode==true && program_ended_with_return==true){
+  if ((timemachine_mode==true && program_ended_with_return==true) || multi_record==true) {
     execvp (org_argv[0], (char *const *) org_argv);
     print_message("Error: exec returned: %s.\n", strerror(errno));
     exit(127);
